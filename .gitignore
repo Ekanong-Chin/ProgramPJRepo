@@ -1,0 +1,15 @@
+# Excel input and output files
+/source/
+/target/
+
+# Temporary Excel files
+~$*.xlsx
+
+# Environment and secrets
+.env
+.env.*
+
+# Python temporary files
+__pycache__/
+*.pyc
+.venv/
