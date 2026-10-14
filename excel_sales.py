@@ -12,6 +12,7 @@ from pathlib import Path
 import posixpath
 import re
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
@@ -95,6 +96,7 @@ class Analysis:
     traces: dict = field(default_factory=dict)
     months: dict = field(default_factory=dict)
     complete: bool = True
+    upsert: dict = field(default_factory=dict)
 
     def error(self, code, category, explanation, row=None, col=None):
         self.issues.append(Issue(code, category, explanation, row, col))
@@ -558,7 +560,105 @@ def validate_output(path, expected):
             raise ValueError('Output header colors mismatch')
 
 
-def transform(source_path, target_dir):
+def read_master(path):
+    """Read the Daily Sales section only; monthly totals are always rebuilt."""
+    source = read_source(path)
+    with zipfile.ZipFile(path) as archive:
+        sheets = ET.fromstring(archive.read('xl/workbook.xml')).find(NS + 'sheets')
+        if len(sheets) != 1 or source.sheet != 'MasterDetail':
+            raise ValueError('Master must contain one MasterDetail worksheet')
+    titles = [r for (r,c), cell in source.cells.items() if c == 1 and cell.value == 'DAILY SALES' and not cell.formula]
+    if len(titles) != 1 or source.merges:
+        raise ValueError('Invalid master Daily Sales structure')
+    header = titles[0] + 1
+    expected = ['Month / Date','Day','Weekday','Tab WK','Tab Promotion']
+    if [source.cell(header,c).value for c in range(1,6)] != expected:
+        raise ValueError('Invalid master headers')
+    last_col = max(c for (r,c),cell in source.cells.items() if r == header and cell.populated())
+    labels = [source.cell(header,c).value for c in range(6,last_col+1)]
+    if not labels or len(labels)>1000 or any(blank(x) or total(x) for x in labels) or len({x.casefold() for x in labels}) != len(labels):
+        raise ValueError('Invalid/duplicate master channels')
+    if any(source.cell(header,c).formula or source.cell(header,c).kind != 'text' for c in range(1,last_col+1)):
+        raise ValueError('Master headers must be literal text')
+    if any(r>header and c>last_col and cell.populated() for (r,c),cell in source.cells.items()):
+        raise ValueError('Master contains daily data without a channel header')
+    values, days = {}, set()
+    last_row = max(r for (r,c),cell in source.cells.items() if cell.populated())
+    for row in range(header+1,last_row+1):
+        if not any(source.cell(row,c).populated() for c in range(1,last_col+1)):
+            continue
+        day = parse_date(source.cell(row,1),source.epoch1904)
+        if day in days:
+            raise ValueError('Duplicate master dates')
+        days.add(day)
+        if len(days)>366 or len(days)*len(labels)>1000000:
+            raise ValueError('Master dimensions exceed approved limits')
+        for col,label in enumerate(labels,6):
+            cell = source.cell(row,col)
+            if cell.formula or cell.unsupported or cell.kind not in {'n','blank'} or (cell.value and not NUMERIC.fullmatch(cell.value)):
+                raise ValueError('Invalid master sales value')
+            value = round_daily(Decimal(cell.value) if cell.value else Decimal(0))
+            if not precision_ok(value):
+                raise ValueError('Unsupported master precision')
+            values[label.casefold(),day] = value
+    if not days:
+        raise ValueError('Master contains no dates')
+    return labels, days, values
+
+
+def latest_master(target_dir, source_stem=None):
+    matches = []
+    prefix = re.escape(source_stem) if source_stem is not None else r'.+'
+    for path in target_dir.iterdir():
+        match = re.fullmatch(prefix + r'_(\d{8}_\d{6})(?:_(\d+))?\.xlsx',path.name,re.IGNORECASE)
+        if path.is_file() and match:
+            matches.append(((match[1],int(match[2] or 0)),path))
+    return max(matches,key=lambda item:item[0])[1] if matches else None
+
+
+def consolidate(result, master_path=None):
+    # Validate incoming source mapping before constructing the combined matrix.
+    workbook_cells(result)
+    labels, days, values = read_master(master_path) if master_path else ([],set(),{})
+    originals = {label.casefold():label for label in labels}
+    inserted = updated = 0
+    incoming = [r for r in result.records if r.status == 'final_selected']
+    for rec in incoming:
+        key = rec.label.casefold()
+        if key not in originals:
+            originals[key] = rec.label
+            labels.append(rec.label)
+        for day,value in rec.values.items():
+            if (key,day) in values:
+                updated += 1
+            else:
+                inserted += 1
+            values[key,day] = value
+            days.add(day)
+    if len(labels)>1000 or len(days)>366 or len(labels)*len(days)>1000000:
+        raise ValueError('Combined workbook exceeds approved limits')
+    merged = Analysis(Source({},[],'MasterDetail'))
+    merged.dates = {col:day for col,day in enumerate(sorted(days),5)}
+    for row,label in enumerate(labels,3):
+        rec = Record(row,3,label,(),(),status='final_selected')
+        for col,day in merged.dates.items():
+            value = values.get((label.casefold(),day),Decimal('0.00'))
+            rec.values[day] = value
+            merged.source.cells[row,col] = Cell('n',str(value))
+        merged.records.append(rec)
+        for month in {(d.year,d.month) for d in days}:
+            amount = exact_sum(v for d,v in rec.values.items() if (d.year,d.month)==month)
+            if not precision_ok(amount):
+                raise ValueError('Combined monthly precision exceeded')
+            merged.months[month[0],month[1],row] = amount
+    result.upsert = {'master': str(master_path.resolve()) if master_path else None,
+                     'updated_keys':updated,'inserted_keys':inserted,
+                     'channels':len(labels),'dates':len(days),
+                     'months':len({(d.year,d.month) for d in days})}
+    return merged
+
+
+def transform(source_path, target_dir, master_path=None):
     source_path, target_dir = Path(source_path), Path(target_dir)
     try:
         result = analyze(read_source(source_path))
@@ -568,14 +668,33 @@ def transform(source_path, target_dir):
     output = None
     if not result.critical:
         temp = None
+        lock = None
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = target_dir / '.sales-upsert.lock'
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.close(descriptor)
+                    lock = lock_path
+                    break
+                except FileExistsError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError('Target is locked by another transformation')
+                    time.sleep(0.05)
+            base = Path(master_path) if master_path is not None else latest_master(target_dir,source_path.stem)
+            try:
+                combined = consolidate(result,base)
+            except (OSError, ValueError, KeyError, InvalidOperation, ET.ParseError, zipfile.BadZipFile, IndexError):
+                result.error('ERR-MASTER-UPSERT','master','Existing master or combined data failed validation; no output published.')
+                return result, None
             with tempfile.NamedTemporaryFile(prefix='.sales-', suffix='.xlsx', dir=target_dir, delete=False) as handle:
                 temp = Path(handle.name)
-            cells = workbook_cells(result)
+            cells = workbook_cells(combined)
             save_workbook(temp, cells)
             validate_output(temp, cells)
-            stem = 'MasterDetail_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+            stem = source_path.stem + '_' + datetime.now().strftime('%Y%m%d_%H%M%S')
             suffix = 0
             while True:
                 candidate = target_dir / (stem + (f'_{suffix:03d}' if suffix else '') + '.xlsx')
@@ -593,17 +712,80 @@ def transform(source_path, target_dir):
                     temp.unlink(missing_ok=True)
                 except OSError:
                     result.issues.append(Issue('WARN-TEMP-CLEANUP', 'output', 'Current-run temporary file could not be removed.', severity='warning'))
+            if lock is not None:
+                try:
+                    lock.unlink(missing_ok=True)
+                except OSError:
+                    result.issues.append(Issue('WARN-LOCK-CLEANUP','output','Current-run lock could not be removed.',severity='warning',action='Remove the stale lock only after confirming no run is active.'))
     return result, output
+
+
+def status_report(result, output):
+    selected = [r for r in result.records if r.status == 'final_selected']
+    return {
+        'status': 'success' if output else 'failed',
+        'output': str(output) if output else None,
+        'channels': result.upsert.get('channels',len(selected)),
+        'dates': result.upsert.get('dates',len(set(result.dates.values()))),
+        'months': result.upsert.get('months',len({(d.year,d.month) for d in result.dates.values()})),
+        'upsert': result.upsert,
+        'validation': 'complete' if result.complete else 'blocked',
+        'formula_cache_policy': 'Last saved numeric cache only; freshness not verified.',
+        'blocked_parent_count': sum(r.status == 'blocked' for r in result.records),
+        'critical_errors': sum(i.severity == 'critical' for i in result.issues),
+        'warnings': sum(i.severity == 'warning' for i in result.issues),
+        'issues': [dict(vars(i), worksheet=result.source.sheet,
+                       cell=column(i.col)+str(i.row) if i.col and i.row else None)
+                   for i in result.issues],
+    }
+
+
+def transform_directory(source_dir, target_dir):
+    source_dir, target_dir = Path(source_dir), Path(target_dir)
+    if not source_dir.is_dir():
+        raise ValueError('Source directory does not exist')
+    if source_dir.resolve() == target_dir.resolve():
+        raise ValueError('Source and target directories must be different')
+    # Snapshot once; do not recurse or import files created during this run.
+    paths = sorted((p for p in source_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() == '.xlsx'
+                    and not p.name.startswith(('~$', '.sales-'))),
+                   key=lambda p:(p.name.casefold(),p.name))
+    if not paths:
+        raise ValueError('No source XLSX files found')
+    if len({p.stem.casefold() for p in paths}) != len(paths):
+        raise ValueError('Ambiguous source names differing only by case')
+    reports = []
+    for path in paths:
+        result, output = transform(path,target_dir)
+        reports.append(dict(status_report(result,output),source=str(path.resolve())))
+    return reports
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source', default='source/TransactionDetail.xlsx')
+    parser.add_argument('--source', default='source', help='Source XLSX file or directory (default: source)')
     parser.add_argument('--target', default='target')
+    parser.add_argument('--master', help='Explicit baseline for a single source file only')
     args = parser.parse_args()
-    result, output = transform(args.source, args.target)
-    selected = [r for r in result.records if r.status == 'final_selected']
-    print(json.dumps({'status': 'success' if output else 'failed', 'output': str(output) if output else None, 'channels': len(selected), 'dates': len(set(result.dates.values())), 'months': len({(d.year,d.month) for d in result.dates.values()}), 'validation': 'complete' if result.complete else 'blocked', 'formula_cache_policy': 'Last saved numeric cache only; freshness not verified.', 'blocked_parent_count': sum(r.status == 'blocked' for r in result.records), 'critical_errors': sum(i.severity == 'critical' for i in result.issues), 'warnings': sum(i.severity == 'warning' for i in result.issues), 'issues': [dict(vars(i), worksheet=result.source.sheet, cell=column(i.col) + str(i.row) if i.col and i.row else None) for i in result.issues]}, ensure_ascii=False, indent=2))
+    source = Path(args.source)
+    if source.is_dir() or source.suffix.lower() != '.xlsx':
+        if args.master:
+            parser.error('--master requires one XLSX source file, not a directory')
+        try:
+            reports = transform_directory(source,args.target)
+        except (OSError,ValueError):
+            print(json.dumps({'status':'failed','code':'ERR-SOURCE-DIRECTORY',
+                              'explanation':'Source directory must exist, contain unambiguous XLSX inputs, and differ from target.'}))
+            return 1
+        successful = sum(r['status']=='success' for r in reports)
+        report = {'status':'success' if successful==len(reports) else 'failed',
+                  'files':len(reports),'succeeded':successful,
+                  'failed':len(reports)-successful,'results':reports}
+        print(json.dumps(report,ensure_ascii=False,indent=2))
+        return 0 if successful==len(reports) else 1
+    result, output = transform(source,args.target,args.master)
+    print(json.dumps(dict(status_report(result,output),source=str(source.resolve())),ensure_ascii=False,indent=2))
     return 0 if output else 1
 
 

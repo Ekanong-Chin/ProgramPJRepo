@@ -1,7 +1,7 @@
 # Excel Sales Transformation — Program Instructions
 
-**Version:** 1.4 — Part 1 Revision 8 (Hierarchy & Parent Total; Requirements Draft for Codex Review)  
-**Status:** Hierarchy Rules Confirmed; Other Implementation Blockers Remain; Implementation Not Approved  
+**Version:** 1.6 — Per-Source Batch Upsert (user-approved implementation update)
+**Status:** Implementation approved in chat; Steps 21–22 override conflicting historical requirements.
 **Project:** ProgramPJRepo  
 **Scope:** Requirements, validation rules, and tests only. Do not implement source code until the user explicitly approves.
 
@@ -943,3 +943,93 @@ Unless otherwise stated, fixtures use valid E1 date, E2=`Sales`, no unlisted mer
 - Remaining blockers for the **full program**: sentinel/footer scan scope and boundary merges; exact Monthly layout; numeric precision/range boundaries; formula variants; runtime/library; resource limits; and end-to-end acceptance fixtures.
 
 **IMPLEMENTATION NOT APPROVED.** Do not generate or modify source code, install dependencies, commit, or push without separate explicit approval.
+
+## Step 21 — Approved Channel/Date Upsert and Daily Rounding (v1.5)
+
+This update implements the user's explicit request to insert or replace records
+by channel and date. It supersedes conflicting historical implementation gates,
+source-only output/date rules, and unrounded daily-sales requirements above.
+Git staging, commits and pushes still require separate explicit approval.
+
+1. A business key is `(channel.casefold(), calendar_date)`. Do not trim names or
+   add Unicode normalization. Preserve existing master channel spelling and order;
+   append genuinely new source channels in first-appearance order.
+2. By default, use the latest `MasterDetail_YYYYMMDD_HHMMSS[_suffix].xlsx` in the
+   target directory as the baseline. Sort by timestamp and numeric suffix, not
+   filesystem modification time. `--master PATH` explicitly selects another base.
+   If no automatic base exists, create an initial master. An explicitly missing
+   or malformed base is critical; never silently discard existing history.
+3. Read the baseline's single MasterDetail sheet and DAILY SALES section. Validate
+   channel/date uniqueness, numeric values and structure. Incoming keys replace
+   existing daily amounts; absent keys are inserted. Never add old and new amounts
+   for the same key. Historical keys not present in the source remain intact.
+4. TransactionDetail blank sales means zero and therefore replaces an existing
+   amount with zero. Zero and negative updates are valid. Round all daily amounts
+   to two decimal places with Decimal ROUND_HALF_UP before merging/aggregating.
+   Existing baseline amounts are normalized with this same daily rounding policy.
+5. Duplicate selected source channel names and duplicate source dates within a
+   single input remain critical because their incoming precedence is ambiguous.
+   The new replace behavior applies between the validated source and baseline;
+   it does not introduce hidden aggregation or keep-last source-row guessing.
+6. Output dates are the chronological union of old and incoming dates. Keep old
+   channels and append new channels; fill missing intersections with numeric zero.
+   These matrix-padding cells are not counted as newly imported source keys.
+7. Rebuild MONTHLY TOTAL from the entire merged daily matrix using exact Decimal
+   sums. Days counts unique dates in the merged month, not only the latest input.
+   Apply existing precision limits and post-save numeric-token validation to the
+   combined workbook. Reject combined resource/precision limit violations.
+8. Preserve source and baseline files. Save the merged result as a new uniquely
+   named MasterDetail, using the existing temporary validation/no-overwrite rules.
+   Automatically subsequent runs use that new version. Do not rewrite the base.
+9. Serialize cooperating writers with a target-directory exclusive lock before
+   selecting the automatic baseline. Wait at most 30 seconds; fail safely on
+   timeout. Never delete another process's lock or guess that a stale lock is safe.
+   Explicit --master runs intentionally use their specified baseline.
+10. Report baseline path, updated_keys, inserted_keys and combined channel/date/
+    month counts. Count every incoming key already in the baseline as updated,
+    even when its numeric value is unchanged. No transaction amounts in logs.
+
+Required acceptance tests (synthetic inputs only): replacement rather than sum;
+new date/channel insertion; preserved old keys; casefold matching; blank-to-zero
+replacement; HALF_UP values; idempotent reruns; monthly recalculation; explicit
+baseline; missing baseline failure with unchanged files; concurrent automatic
+runs preserving both updates; no overwritten prior workbook; strict output readback.
+
+## Step 22 — Per-Source Batch Processing and Output Families (v1.6)
+
+This user-approved update overrides the single-source default and global
+MasterDetail filename/baseline selection in Steps 2, 7 and 21.
+
+1. `--source` accepts one XLSX file or a directory; the default is `source/`.
+   For directories, snapshot all direct-child regular files with case-insensitive
+   `.xlsx` extensions, sorted by filename. Do not recurse. Ignore Excel lock files
+   starting `~$`, current-run `.sales-` temporary files and non-XLSX files.
+2. Every input has its own output family, using the exact input stem. For example,
+   `aaa.xlsx` creates `aaa_YYYYMMDD_HHMMSS.xlsx`; `bbb.xlsx` creates
+   `bbb_YYYYMMDD_HHMMSS.xlsx`. The worksheet remains named `MasterDetail`.
+3. A later run automatically reads only the newest timestamp/suffix version of
+   that source family. Match the complete escaped source stem, case-insensitively;
+   `aaa` must not match `aaa_more`. Sort timestamps then numeric collision suffixes.
+   Never combine histories for different source stems, even if channel/date keys
+   coincide. Reject ambiguous input stems differing only by case in a single batch.
+4. Within each family, keep Step 21 upsert: matching channel/date replaces the old
+   daily amount; new keys are inserted; old unmatched keys remain; monthly totals
+   are rebuilt using daily ROUND_HALF_UP amounts. Save a new version, preserving
+   all previous source and target files. Append `_001`, `_002`, etc. on collisions.
+5. No matching family means a new initial workbook. Old `MasterDetail_*.xlsx`
+   files are not automatically assigned to a source. For intentional migration,
+   use single-file `--source` with explicit `--master PATH`. Directory mode rejects
+   `--master`, because one baseline must not be applied to every source.
+6. Each source is an independent transaction: critical failure publishes no output
+   for that file but does not stop other files. Batch JSON reports per-file source,
+   baseline, output, upsert counts and issues, plus success/failure file counts.
+   Exit 0 only if all files succeeded; otherwise exit 1. Empty/missing source
+   directories and identical source/target directories fail without publishing.
+7. Retain the target-directory lock around baseline selection/merge/publication,
+   so cooperating simultaneous runs cannot lose updates to the same family.
+
+Acceptance additions: aaa/bbb with identical keys remain isolated; rerun updates
+only the matching family; new date insertion; old versions unchanged; uppercase
+extensions; ignored lock files/subdirectories; escaped filename punctuation;
+numeric suffix ordering; collision names; one failed input does not block another;
+empty/missing source directory; source/target same-path rejection.

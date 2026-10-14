@@ -1,0 +1,1 @@
+.venv/python.exe excel_sales.py --source source/TransactionDetail.xlsx --target target

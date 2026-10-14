@@ -6,18 +6,27 @@ modifying it and does not transmit transaction contents externally.
 ## Run
 
 ```powershell
-python excel_sales.py --source source/TransactionDetail.xlsx --target target
+python excel_sales.py --source source --target target
 ```
 
 An isolated Python 3.13.7 runtime was downloaded into ignored `.venv/` for this
 workspace. No third-party packages were installed:
 
 ```powershell
-.venv/python.exe excel_sales.py --source source/TransactionDetail.xlsx --target target
+.venv/python.exe excel_sales.py --source source --target target
 ```
 
-The JSON report returns status, output path, counts, issues and complete/blocked
-validation. Exit status is 0 for published output, 1 for failure. Formula caches
+Directory mode reads every direct-child `.xlsx` file (including uppercase
+extensions), ignoring Excel `~$` lock files and subdirectories. A single XLSX path
+is also supported. Source and target directories must differ.
+
+Each source has its own output history: `aaa.xlsx` produces
+`aaa_YYYYMMDD_HHMMSS.xlsx`, while `bbb.xlsx` produces
+`bbb_YYYYMMDD_HHMMSS.xlsx`. Collisions append `_001`, `_002`, etc.
+
+The batch JSON report returns per-file status, output, counts and issues, plus
+success/failure totals. One invalid file does not stop the others. Exit status
+is 0 only when all files succeeded, 1 for any failure. Formula caches
 are the last saved values; freshness is not verified.
 
 ## Approved decisions
@@ -68,11 +77,37 @@ The example creates source and output under ignored `target/synthetic/` and refu
 to replace the existing synthetic source. Rounded October totals are HATO=`0.30`,
 Scheduled=`0.00`, Gofresh=`1.00`; November totals are `0.00`, `2.13`, `-1.00`.
 
-No production workbook or interactive Excel opening/recalculation has been tested.
+Interactive Excel opening/recalculation has not been tested.
 Test results verify the stored workbook rather than future Excel behavior.
-The existing README and requirement draft are preserved.
+The existing README is preserved; Steps 21-22 describe upsert and per-source batches.
 
-Latest executed validation: 21 unittest methods passed, including table-driven
+Latest executed validation: 29 unittest methods passed, including table-driven
 hierarchy and formula subcases; no skipped tests. CLI synthetic transformation
 completed with 3 channels, 3 dates, 2 months and zero critical errors. Tests inspect
 stored workbook values; interactive Excel and production files were not used.
+
+## Insert or replace by channel and date
+
+For each source, the default run reads only its latest timestamped workbook in
+`--target` (exact source stem, timestamp then numeric suffix), and replaces
+matching `(channel.casefold(), date)` daily amounts, inserts new keys and preserves
+old history. Monthly totals/Days are rebuilt from the complete merged matrix.
+New channels are appended; missing matrix intersections are zero-filled. The
+result is a new version, preserving all prior workbooks. The JSON `upsert` field
+reports baseline, updated/inserted key counts and combined dimensions.
+
+Select a particular baseline explicitly:
+
+```powershell
+.venv/python.exe excel_sales.py --source source/TransactionDetail.xlsx --target target --master target/MasterDetail_20261014_005446.xlsx
+```
+
+This also allows intentional migration of an old `MasterDetail_*.xlsx` history.
+Old global MasterDetail files are never automatically assigned to a source.
+`--master` is only supported with a single XLSX source, not directory mode.
+
+An explicit missing/invalid master fails safely. A target-directory lock serializes
+automatic read/merge/publish operations, with a 30-second timeout. If a process is
+terminated and leaves `.sales-upsert.lock`, remove it only after verifying that
+no transformation is active. Duplicate channels/dates inside a single source
+are still rejected; source-versus-master duplicate keys are replaced, not summed.
