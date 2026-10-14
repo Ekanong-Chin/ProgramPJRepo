@@ -81,7 +81,7 @@ Interactive Excel opening/recalculation has not been tested.
 Test results verify the stored workbook rather than future Excel behavior.
 The existing README is preserved; Steps 21-22 describe upsert and per-source batches.
 
-Latest executed validation: 29 unittest methods passed, including table-driven
+Latest executed validation: 32 unittest methods passed, including table-driven
 hierarchy and formula subcases; no skipped tests. CLI synthetic transformation
 completed with 3 channels, 3 dates, 2 months and zero critical errors. Tests inspect
 stored workbook values; interactive Excel and production files were not used.
@@ -92,7 +92,8 @@ For each source, the default run reads only its latest timestamped workbook in
 `--target` (exact source stem, timestamp then numeric suffix), and replaces
 matching `(channel.casefold(), date)` daily amounts, inserts new keys and preserves
 old history. Monthly totals/Days are rebuilt from the complete merged matrix.
-New channels are appended; missing matrix intersections are zero-filled. The
+Channels are grouped by their resolved A/B/C parents, retaining first-seen sibling
+order. New channels join their group's block; missing intersections are zero-filled. The
 result is a new version, preserving all prior workbooks. The JSON `upsert` field
 reports baseline, updated/inserted key counts and combined dimensions.
 
@@ -111,3 +112,13 @@ automatic read/merge/publish operations, with a 30-second timeout. If a process 
 terminated and leaves `.sales-upsert.lock`, remove it only after verifying that
 no transformation is active. Duplicate channels/dates inside a single source
 are still rejected; source-versus-master duplicate keys are replaced, not summed.
+
+## Channel group ordering
+
+Both Monthly Total and Daily Sales put channels of the same hierarchy group
+together (A, then B, then C), without alphabetic renaming or numeric aggregation.
+Verified parent paths are stored in a worksheet extension for future partial
+upserts. Masters created before this feature acquire grouping from incoming
+matching channels; unknown historical channels retain stable ungrouped ordering.
+If an external editor removes the extension, the same fallback applies.
+Group names compare exactly; upsert channel keys still use casefold.

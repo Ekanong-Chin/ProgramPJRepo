@@ -22,6 +22,7 @@ REL = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
 SUMMARIES = {'total sales', 'grand total', 'total', 'ยอดขายรวม'}
 MINIMUM = Decimal('2.2250738585072E-308')
 MAXIMUM = Decimal('1.79769313486231E+308')
+GROUP_NS = 'urn:programpj:channel-groups:v1'
 NUMERIC = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z')
 
 
@@ -97,6 +98,7 @@ class Analysis:
     months: dict = field(default_factory=dict)
     complete: bool = True
     upsert: dict = field(default_factory=dict)
+    channel_groups: dict = field(default_factory=dict)
 
     def error(self, code, category, explanation, row=None, col=None):
         self.issues.append(Issue(code, category, explanation, row, col))
@@ -510,7 +512,7 @@ def numeric_token(value):
     return str(value)
 
 
-def save_workbook(path, cells):
+def save_workbook(path, cells, channel_groups=None):
     rows = {}
     for (row, col), (value, style) in sorted(cells.items()):
         ref = column(col) + str(row)
@@ -525,16 +527,23 @@ def save_workbook(path, cells):
         z.writestr('xl/workbook.xml', f'<workbook xmlns="{main}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="MasterDetail" sheetId="1" r:id="rId1"/></sheets></workbook>')
         z.writestr('xl/_rels/workbook.xml.rels', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
         z.writestr('xl/styles.xml', styles)
+        if channel_groups is not None:
+            metadata = '<extLst><ext uri="{C026266F-7B44-4F61-AF0C-22D99C55CC52}"><groups xmlns="' + GROUP_NS + '">' + escape(json.dumps(channel_groups,ensure_ascii=False)) + '</groups></ext></extLst>'
+            sheet = sheet.replace('</worksheet>',metadata+'</worksheet>')
         z.writestr('xl/worksheets/sheet1.xml', sheet)
 
 
-def validate_output(path, expected):
+def validate_output(path, expected, channel_groups=None):
     with zipfile.ZipFile(path) as z:
         workbook = ET.fromstring(z.read('xl/workbook.xml'))
         sheets = workbook.find(NS + 'sheets')
         if len(sheets) != 1 or sheets[0].get('name') != 'MasterDetail':
             raise ValueError('Invalid output worksheet structure')
         root = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
+        if channel_groups is not None:
+            metadata = root.find('.//{' + GROUP_NS + '}groups')
+            if metadata is None or json.loads(metadata.text or '') != channel_groups:
+                raise ValueError('Output channel grouping metadata mismatch')
         actual = {}
         for cell in root.findall('.//' + NS + 'c'):
             key = coordinates(cell.get('r'))
@@ -616,15 +625,55 @@ def latest_master(target_dir, source_stem=None):
     return max(matches,key=lambda item:item[0])[1] if matches else None
 
 
+def read_channel_groups(path):
+    with zipfile.ZipFile(path) as archive:
+        workbook = ET.fromstring(archive.read('xl/workbook.xml'))
+        first = workbook.find(NS+'sheets')[0]
+        relations = ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))
+        relation = next(x for x in relations if x.get('Id')==first.get(REL+'id'))
+        target = relation.get('Target','')
+        target = posixpath.normpath(target.lstrip('/') if target.startswith('/') else 'xl/'+target)
+        sheet = ET.fromstring(archive.read(target))
+        metadata = sheet.find('.//{'+GROUP_NS+'}groups')
+        if metadata is None:
+            return {}
+        groups = json.loads(metadata.text or '')
+        if not isinstance(groups,dict) or any(not isinstance(k,str) or not isinstance(v,list) or len(v)>3 or any(not isinstance(x,str) for x in v) for k,v in groups.items()):
+            raise ValueError('Invalid channel grouping metadata')
+        return groups
+
+
+def grouped_channel_order(labels, groups):
+    """Stable hierarchy traversal: siblings retain their first-seen order."""
+    tree = {}
+    for label in labels:
+        node = tree
+        for level,parent in enumerate(groups.get(label.casefold(),[])):
+            if not blank(parent) and not total(parent):
+                node = node.setdefault(('group',level,parent),{})
+        node[('channel',label.casefold())] = label
+    ordered = []
+    def visit(node):
+        for key,value in node.items():
+            if key[0]=='channel':
+                ordered.append(value)
+            else:
+                visit(value)
+    visit(tree)
+    return ordered
+
+
 def consolidate(result, master_path=None):
     # Validate incoming source mapping before constructing the combined matrix.
     workbook_cells(result)
     labels, days, values = read_master(master_path) if master_path else ([],set(),{})
+    groups = read_channel_groups(master_path) if master_path else {}
     originals = {label.casefold():label for label in labels}
     inserted = updated = 0
     incoming = [r for r in result.records if r.status == 'final_selected']
     for rec in incoming:
         key = rec.label.casefold()
+        groups[key] = list(rec.path[:-1])
         if key not in originals:
             originals[key] = rec.label
             labels.append(rec.label)
@@ -637,7 +686,9 @@ def consolidate(result, master_path=None):
             days.add(day)
     if len(labels)>1000 or len(days)>366 or len(labels)*len(days)>1000000:
         raise ValueError('Combined workbook exceeds approved limits')
+    labels = grouped_channel_order(labels,groups)
     merged = Analysis(Source({},[],'MasterDetail'))
+    merged.channel_groups = {label.casefold():groups.get(label.casefold(),[]) for label in labels}
     merged.dates = {col:day for col,day in enumerate(sorted(days),5)}
     for row,label in enumerate(labels,3):
         rec = Record(row,3,label,(),(),status='final_selected')
@@ -692,8 +743,8 @@ def transform(source_path, target_dir, master_path=None):
             with tempfile.NamedTemporaryFile(prefix='.sales-', suffix='.xlsx', dir=target_dir, delete=False) as handle:
                 temp = Path(handle.name)
             cells = workbook_cells(combined)
-            save_workbook(temp, cells)
-            validate_output(temp, cells)
+            save_workbook(temp, cells, combined.channel_groups)
+            validate_output(temp, cells, combined.channel_groups)
             stem = source_path.stem + '_' + datetime.now().strftime('%Y%m%d_%H%M%S')
             suffix = 0
             while True:

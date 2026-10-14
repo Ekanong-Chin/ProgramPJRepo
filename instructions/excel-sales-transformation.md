@@ -1,7 +1,7 @@
 # Excel Sales Transformation — Program Instructions
 
-**Version:** 1.6 — Per-Source Batch Upsert (user-approved implementation update)
-**Status:** Implementation approved in chat; Steps 21–22 override conflicting historical requirements.
+**Version:** 1.7 — Hierarchy-Grouped Channel Columns (user-approved implementation update)
+**Status:** Implementation approved in chat; Steps 21–23 override conflicting historical requirements.
 **Project:** ProgramPJRepo  
 **Scope:** Requirements, validation rules, and tests only. Do not implement source code until the user explicitly approves.
 
@@ -1033,3 +1033,37 @@ only the matching family; new date insertion; old versions unchanged; uppercase
 extensions; ignored lock files/subdirectories; escaped filename punctuation;
 numeric suffix ordering; collision names; one failed input does not block another;
 empty/missing source directory; source/target same-path rejection.
+
+## Step 23 — Channel Column Ordering by Hierarchy Group (v1.7)
+
+This user-approved requirement supersedes global source-first channel ordering
+where that would separate members of the same hierarchy group.
+
+1. Display channels sharing the same resolved A/B/C ancestry together, traversing
+   parent groups hierarchically. Use only the levels above each selected channel:
+   D channels group by A/B/C; C channels by A/B; B channels by A. Skip blank parent
+   levels and Total control markers. Preserve exact channel labels.
+2. Use stable first-appearance ordering of sibling groups and channels, not
+   alphabetical sorting. For upsert, existing master order establishes the initial
+   appearance order. New channels join their group's block instead of being
+   appended after unrelated groups. New groups follow existing sibling groups.
+3. Compare parent group labels exactly, including case. Grouping is display-only:
+   it does not combine hierarchy instances for subtotal classification, aggregate
+   records, or change casefold channel/date upsert keys or numeric amounts.
+4. Apply exactly the same resulting channel order to Monthly Total and Daily Sales.
+   Reorder headers and their values together; calculations remain keyed by channel.
+5. Persist verified channel parent paths in a namespaced worksheet extension
+   (`urn:programpj:channel-groups:v1`), preserving the single MasterDetail sheet.
+   Validate this metadata after saving. Reuse it for channels absent from a later
+   source; incoming verified paths update that channel's display group.
+6. For old masters without grouping metadata, learn paths from matching incoming
+   channels. Keep unknown-history channels in stable existing order as ungrouped
+   entries; do not infer hierarchy from names. External editors may strip extension
+   metadata; the same fallback applies if it is absent. Malformed metadata is an
+   error, not silently guessed. Existing master channel spelling is retained.
+
+Acceptance: interleaved OMS/Shop/OMS source channels produce adjacent OMS groups;
+Monthly/Daily headers match; each value remains attached to its channel/date;
+new channels join an existing group after upsert; historical channels retain group
+paths across partial inputs; case-distinct parents remain distinct; old masters
+without metadata are readable; mismatched serialized metadata fails validation.
